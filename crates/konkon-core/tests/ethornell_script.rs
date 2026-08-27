@@ -8,8 +8,12 @@ use konkon_core::engines::ethornell::archive::read_arc;
 use konkon_core::engines::ethornell::dsc::{decompress, is_dsc};
 use konkon_core::engines::ethornell::layout::{ScriptLayout, StrKind};
 use konkon_core::engines::ethornell::script::parse;
+use konkon_core::KonkonError;
 
 const MAGIC: &[u8] = b"BurikoCompiledScriptVer1.00\0";
+/// `magic.len() (0x1C) + header_size (4)` — every fixture uses `header_size = 4`
+/// (no header body), so the bytecode starts here.
+const CODE_OFFSET: usize = 0x20;
 
 fn sjis(s: &str) -> Vec<u8> {
     let (enc, _, had_errors) = encoding_rs::SHIFT_JIS.encode(s);
@@ -30,6 +34,49 @@ fn push_str(buf: &mut Vec<u8>, addr: i32) {
     push_i32(buf, addr);
 }
 
+/// Address (relative to `code_offset`) of pool entry `idx`, given the bytecode
+/// length and the NUL-excluded byte length of each pool string. The pool starts
+/// immediately after the bytecode, i.e. at relative address `code_len`.
+fn addr_of(code_len: usize, pool_lens: &[usize], idx: usize) -> i32 {
+    let mut a = code_len;
+    for &l in &pool_lens[..idx] {
+        a += l + 1;
+    }
+    a as i32
+}
+
+/// Assemble `magic + header_size(4) + code + pool` (each pool string
+/// NUL-terminated).
+fn assemble(code: &[u8], pool: &[&[u8]]) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(MAGIC);
+    push_i32(&mut b, 4);
+    assert_eq!(b.len(), CODE_OFFSET);
+    b.extend_from_slice(code);
+    for s in pool {
+        b.extend_from_slice(s);
+        b.push(0);
+    }
+    b
+}
+
+fn assert_script_format_err(err: KonkonError) {
+    assert!(
+        matches!(
+            err,
+            KonkonError::Format {
+                container: "script",
+                ..
+            }
+        ),
+        "expected KonkonError::Format {{ container: \"script\", .. }}, got: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Minimal end-to-end fixture
+// ---------------------------------------------------------------------------
+
 /// Minimal V1 script:
 ///
 /// ```text
@@ -42,7 +89,6 @@ fn push_str(buf: &mut Vec<u8>, addr: i32) {
 /// ```
 struct Fixture {
     bytes: Vec<u8>,
-    code_offset: usize,
     code_length: usize,
     name: Vec<u8>,
     message: Vec<u8>,
@@ -53,37 +99,23 @@ fn build_fixture() -> Fixture {
     let name = sjis("芳乃");
     let message = sjis("「テスト」");
     let voice = b"_PlayVoice".to_vec();
+    let pool_lens = [name.len(), message.len(), voice.len()];
 
-    // code: 2x push_str (8) + show_message (4) + push_str (8) + user_fn (4) + term (4)
+    // 2x push_str (16) + show_message (4) + push_str (8) + user_fn (4) + term (4)
     let code_length = 8 + 8 + 4 + 8 + 4 + 4;
-    let code_offset = MAGIC.len() + 4; // header_size = 4 -> no header body
-    let pool_start = code_offset + code_length;
 
-    let addr_name = (pool_start - code_offset) as i32;
-    let addr_message = (pool_start + name.len() + 1 - code_offset) as i32;
-    let addr_voice = (pool_start + name.len() + 1 + message.len() + 1 - code_offset) as i32;
+    let mut code = Vec::new();
+    push_str(&mut code, addr_of(code_length, &pool_lens, 0));
+    push_str(&mut code, addr_of(code_length, &pool_lens, 1));
+    push_i32(&mut code, 0x0140);
+    push_str(&mut code, addr_of(code_length, &pool_lens, 2));
+    push_i32(&mut code, 0x001C);
+    push_i32(&mut code, 0x001B);
+    assert_eq!(code.len(), code_length);
 
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(MAGIC);
-    push_i32(&mut bytes, 4); // header_size
-
-    assert_eq!(bytes.len(), code_offset);
-    push_str(&mut bytes, addr_name);
-    push_str(&mut bytes, addr_message);
-    push_i32(&mut bytes, 0x0140);
-    push_str(&mut bytes, addr_voice);
-    push_i32(&mut bytes, 0x001C);
-    push_i32(&mut bytes, 0x001B);
-    assert_eq!(bytes.len(), pool_start);
-
-    for s in [&name, &message, &voice] {
-        bytes.extend_from_slice(s);
-        bytes.push(0);
-    }
-
+    let bytes = assemble(&code, &[&name, &message, &voice]);
     Fixture {
         bytes,
-        code_offset,
         code_length,
         name,
         message,
@@ -97,27 +129,36 @@ fn parses_minimal_v1_script() {
     let parsed = parse(&fx.bytes).expect("parse should succeed");
     let layout = &parsed.layout;
 
-    assert_eq!(layout.code_offset, fx.code_offset);
+    assert_eq!(layout.code_offset, CODE_OFFSET);
     assert_eq!(layout.code_length, fx.code_length);
-    assert_eq!(layout.prefix.len(), fx.code_offset + fx.code_length);
-    assert_eq!(layout.prefix, &fx.bytes[..fx.code_offset + fx.code_length]);
+    assert_eq!(layout.prefix.len(), CODE_OFFSET + fx.code_length);
+    assert_eq!(layout.prefix, &fx.bytes[..CODE_OFFSET + fx.code_length]);
+
+    // Original pool, in file order.
+    let pool_start = CODE_OFFSET + fx.code_length;
+    assert_eq!(layout.pool.len(), 3);
+    assert_eq!(layout.pool[0].offset, pool_start);
+    assert_eq!(layout.pool[0].bytes, fx.name);
+    assert_eq!(layout.pool[1].bytes, fx.message);
+    assert_eq!(layout.pool[2].bytes, fx.voice);
+    assert!(layout.pool_tail.is_empty());
 
     assert_eq!(layout.strings.len(), 3);
 
     assert_eq!(layout.strings[0].kind, StrKind::CharacterName);
     assert_eq!(layout.strings[0].bytes, fx.name);
-    assert_eq!(
-        layout.strings[0].text_offset,
-        fx.code_offset + fx.code_length
-    );
+    assert_eq!(layout.strings[0].pool_index, 0);
+    assert_eq!(layout.strings[0].text_offset, pool_start);
     // operand offset points at the i32 address inside the first push_str
-    assert_eq!(layout.strings[0].operand_offset, fx.code_offset + 4);
+    assert_eq!(layout.strings[0].operand_offset, CODE_OFFSET + 4);
 
     assert_eq!(layout.strings[1].kind, StrKind::Message);
     assert_eq!(layout.strings[1].bytes, fx.message);
+    assert_eq!(layout.strings[1].pool_index, 1);
 
     assert_eq!(layout.strings[2].kind, StrKind::Internal);
     assert_eq!(layout.strings[2].bytes, fx.voice);
+    assert_eq!(layout.strings[2].pool_index, 2);
 
     assert_eq!(layout.translatable_indices(), vec![0, 1]);
 }
@@ -131,52 +172,276 @@ fn layout_json_roundtrips() {
     assert_eq!(back, layout);
 }
 
+// ---------------------------------------------------------------------------
+// Individual walk behaviors
+// ---------------------------------------------------------------------------
+
 #[test]
-fn rejects_bad_magic() {
-    let err = parse(b"not a buriko script at all, nope nope nope\0").unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("script"), "got: {msg}");
+fn choice_screen_emits_every_operand_as_message_in_push_order() {
+    let pool: [&[u8]; 3] = [b"AAA", b"BB", b"CCCC"];
+    let pool_lens = [3, 2, 4];
+    let code_len = 8 * 3 + 4 + 4;
+
+    let mut code = Vec::new();
+    push_str(&mut code, addr_of(code_len, &pool_lens, 0));
+    push_str(&mut code, addr_of(code_len, &pool_lens, 1));
+    push_str(&mut code, addr_of(code_len, &pool_lens, 2));
+    push_i32(&mut code, 0x0160); // show choice screen
+    push_i32(&mut code, 0x001B); // terminate
+    assert_eq!(code.len(), code_len);
+
+    let layout = parse(&assemble(&code, &pool)).unwrap().layout;
+
+    assert_eq!(layout.strings.len(), 3);
+    assert!(layout.strings.iter().all(|s| s.kind == StrKind::Message));
+    // Push order preserved (the C# restores order via Insert(0, ...)).
+    assert_eq!(layout.strings[0].bytes, b"AAA");
+    assert_eq!(layout.strings[1].bytes, b"BB");
+    assert_eq!(layout.strings[2].bytes, b"CCCC");
+    assert_eq!(
+        layout
+            .strings
+            .iter()
+            .map(|s| s.pool_index)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(layout.translatable_indices(), vec![0, 1, 2]);
 }
 
 #[test]
-fn unknown_opcode_is_an_error_not_a_skip() {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(MAGIC);
+fn user_function_call_select_ex_runs_the_choice_handler() {
+    // Choices pushed first, "_SelectEx" pushed last (it is the fn name, on top).
+    let pool: [&[u8]; 3] = [b"cho0", b"cho1", b"_SelectEx"];
+    let pool_lens = [4, 4, 9];
+    let code_len = 8 * 3 + 4 + 4;
+
+    let mut code = Vec::new();
+    push_str(&mut code, addr_of(code_len, &pool_lens, 0));
+    push_str(&mut code, addr_of(code_len, &pool_lens, 1));
+    push_str(&mut code, addr_of(code_len, &pool_lens, 2));
+    push_i32(&mut code, 0x001C); // call user function
+    push_i32(&mut code, 0x001B);
+    assert_eq!(code.len(), code_len);
+
+    let layout = parse(&assemble(&code, &pool)).unwrap().layout;
+
+    assert_eq!(layout.strings.len(), 3);
+    // fn name emitted first, as Internal
+    assert_eq!(layout.strings[0].bytes, b"_SelectEx");
+    assert_eq!(layout.strings[0].kind, StrKind::Internal);
+    assert_eq!(layout.strings[0].pool_index, 2);
+    // then the remaining stack, as Message, in push order
+    assert_eq!(layout.strings[1].bytes, b"cho0");
+    assert_eq!(layout.strings[1].kind, StrKind::Message);
+    assert_eq!(layout.strings[2].bytes, b"cho1");
+    assert_eq!(layout.strings[2].kind, StrKind::Message);
+    assert_eq!(layout.translatable_indices(), vec![1, 2]);
+}
+
+#[test]
+fn flush_opcodes_dump_the_stack_as_internal_and_the_walk_continues() {
+    // (opcode, number of i32 operands it consumes per the V1 template map)
+    for (opcode, operand_words) in [(0x007E_i32, 1_usize), (0x007F, 2), (0x00FE, 0)] {
+        let pool: [&[u8]; 3] = [b"s0", b"s1", b"s2"];
+        let pool_lens = [2, 2, 2];
+        let code_len = 8 + 8 + 4 + 4 * operand_words + 8 + 4;
+
+        let mut code = Vec::new();
+        push_str(&mut code, addr_of(code_len, &pool_lens, 0));
+        push_str(&mut code, addr_of(code_len, &pool_lens, 1));
+        push_i32(&mut code, opcode);
+        for _ in 0..operand_words {
+            push_i32(&mut code, 0);
+        }
+        push_str(&mut code, addr_of(code_len, &pool_lens, 2));
+        push_i32(&mut code, 0x001B);
+        assert_eq!(code.len(), code_len, "opcode 0x{opcode:04X}");
+
+        let layout = parse(&assemble(&code, &pool)).unwrap().layout;
+
+        // s1, s0 flushed at the opcode (reverse pop order); s2 flushed at 0x001B.
+        assert_eq!(layout.strings.len(), 3, "opcode 0x{opcode:04X}");
+        assert!(
+            layout.strings.iter().all(|s| s.kind == StrKind::Internal),
+            "opcode 0x{opcode:04X}"
+        );
+        assert_eq!(layout.strings[0].bytes, b"s1", "opcode 0x{opcode:04X}");
+        assert_eq!(layout.strings[1].bytes, b"s0", "opcode 0x{opcode:04X}");
+        assert_eq!(layout.strings[2].bytes, b"s2", "opcode 0x{opcode:04X}");
+        assert!(layout.translatable_indices().is_empty());
+    }
+}
+
+#[test]
+fn termination_is_deferred_until_all_forward_code_addresses_are_resolved() {
+    // 0x0001 (template "c") pushes a forward code address A = 20.
+    //   pos after           = code_offset + 8
+    // 0x001B  (first term)   consumed = 12  -> 20 < 12 is false -> DO NOT break
+    // 0x0003 push_str S0
+    // 0x001C  user fn call   pops S0 -> Internal, reads "_Foo" (not _SelectEx)
+    // 0x001B  (second term)  consumed = 28  -> 20 < 28 is true  -> break
+    let pool: [&[u8]; 1] = [b"_Foo"];
+    let pool_lens = [4];
+    let code_len = 4 + 4 + 4 + 8 + 4 + 4; // = 28
+
+    let mut code = Vec::new();
+    push_i32(&mut code, 0x0001);
+    push_i32(&mut code, 20); // forward code address
+    push_i32(&mut code, 0x001B); // must NOT terminate here
+    push_str(&mut code, addr_of(code_len, &pool_lens, 0));
+    push_i32(&mut code, 0x001C);
+    push_i32(&mut code, 0x001B); // terminates here
+    assert_eq!(code.len(), code_len);
+
+    let layout = parse(&assemble(&code, &pool)).unwrap().layout;
+
+    // Stopped at the SECOND terminator, not the first (12).
+    assert_eq!(layout.code_length, 28);
+    // The push_str + user-fn AFTER the first terminator were still walked.
+    assert_eq!(layout.strings.len(), 1);
+    assert_eq!(layout.strings[0].kind, StrKind::Internal);
+    assert_eq!(layout.strings[0].bytes, b"_Foo");
+}
+
+// ---------------------------------------------------------------------------
+// Malformed input -> Err (never panic). The brief's explicit contract.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rejects_bad_magic() {
+    let err = parse(b"not a buriko script at all, nope nope nope\0").unwrap_err();
+    assert!(err.to_string().contains("magic"), "got: {err}");
+    assert_script_format_err(err);
+}
+
+#[test]
+fn rejects_negative_header_size() {
+    let mut b = MAGIC.to_vec();
+    push_i32(&mut b, -4);
+    assert_script_format_err(parse(&b).unwrap_err());
+}
+
+#[test]
+fn rejects_code_offset_past_eof() {
+    let mut b = MAGIC.to_vec();
+    push_i32(&mut b, 0x0100); // header_size 256, file is 32 bytes
+    assert_script_format_err(parse(&b).unwrap_err());
+}
+
+#[test]
+fn rejects_truncated_opcode_mid_stream() {
+    let mut b = MAGIC.to_vec();
+    push_i32(&mut b, 4);
+    b.extend_from_slice(&[0x03, 0x00]); // 2 bytes: cannot read an i32 opcode
+    assert_script_format_err(parse(&b).unwrap_err());
+}
+
+#[test]
+fn rejects_truncated_operand_mid_stream() {
+    let mut b = MAGIC.to_vec();
+    push_i32(&mut b, 4);
+    push_i32(&mut b, 0x0003); // push-string-address opcode
+    b.extend_from_slice(&[0x00, 0x00]); // partial operand
+    assert_script_format_err(parse(&b).unwrap_err());
+}
+
+#[test]
+fn rejects_unknown_opcode_in_a_table_gap() {
+    // 0x0154 sits in a real gap (table has 0x0153 then 0x0156) — an unknown
+    // opcode must be an error, not a silent skip.
+    let mut code = Vec::new();
+    push_i32(&mut code, 0x0154);
+    push_i32(&mut code, 0x001B);
+    let err = parse(&assemble(&code, &[])).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("opcode"),
+        "got: {err}"
+    );
+    assert_script_format_err(err);
+}
+
+#[test]
+fn rejects_negative_string_address() {
+    let mut code = Vec::new();
+    push_str(&mut code, -100); // code_offset + (-100) < 0
+    push_i32(&mut code, 0x001C);
+    push_i32(&mut code, 0x001B);
+    assert_script_format_err(parse(&assemble(&code, &[b"x"])).unwrap_err());
+}
+
+#[test]
+fn rejects_string_address_past_end() {
+    let mut code = Vec::new();
+    push_str(&mut code, 100_000);
+    push_i32(&mut code, 0x001C);
+    push_i32(&mut code, 0x001B);
+    assert_script_format_err(parse(&assemble(&code, &[b"x"])).unwrap_err());
+}
+
+#[test]
+fn rejects_unterminated_pool_string() {
+    let mut code = Vec::new();
+    push_str(&mut code, 16); // addr 16 == code_len -> start of the pool region
+    push_i32(&mut code, 0x001C);
+    push_i32(&mut code, 0x001B);
+    assert_eq!(code.len(), 16);
+
+    let mut bytes = MAGIC.to_vec();
     push_i32(&mut bytes, 4);
-    push_i32(&mut bytes, 0x0EEE); // not in the V1 operand-template map
-    push_i32(&mut bytes, 0x001B);
-    let err = parse(&bytes).unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("script"), "got: {msg}");
-    assert!(msg.to_lowercase().contains("opcode"), "got: {msg}");
+    bytes.extend_from_slice(&code);
+    bytes.extend_from_slice(b"_Foo"); // no NUL, runs off the end
+
+    assert_script_format_err(parse(&bytes).unwrap_err());
+}
+
+#[test]
+fn rejects_string_reference_not_on_a_pool_boundary() {
+    // push_str NAME, push_str MSG, show_message; MSG's address points one byte
+    // into the pool region (mid-string), not at a NUL-split boundary.
+    let name = b"X";
+    let msg = b"AB";
+    let pool_lens = [name.len(), msg.len()];
+    let code_len = 8 + 8 + 4 + 4;
+
+    let mut code = Vec::new();
+    push_str(&mut code, addr_of(code_len, &pool_lens, 0));
+    push_str(&mut code, addr_of(code_len, &pool_lens, 0) + 1); // mid-string
+    push_i32(&mut code, 0x0140);
+    push_i32(&mut code, 0x001B);
+
+    assert_script_format_err(parse(&assemble(&code, &[name, msg])).unwrap_err());
 }
 
 #[test]
 fn empty_string_at_message_address_is_internal() {
     // push_str "" ; push_str "" ; show_message -> both empty -> both Internal
     let code_length = 8 + 8 + 4 + 4;
-    let code_offset = MAGIC.len() + 4;
-    let pool_start = code_offset + code_length;
-    let addr_empty = (pool_start - code_offset) as i32;
+    let addr_empty = addr_of(code_length, &[0], 0);
 
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(MAGIC);
-    push_i32(&mut bytes, 4);
-    push_str(&mut bytes, addr_empty);
-    push_str(&mut bytes, addr_empty);
-    push_i32(&mut bytes, 0x0140);
-    push_i32(&mut bytes, 0x001B);
-    bytes.push(0); // the empty string
+    let mut code = Vec::new();
+    push_str(&mut code, addr_empty);
+    push_str(&mut code, addr_empty);
+    push_i32(&mut code, 0x0140);
+    push_i32(&mut code, 0x001B);
 
-    let layout = parse(&bytes).unwrap().layout;
+    let layout = parse(&assemble(&code, &[b""])).unwrap().layout;
+    assert_eq!(layout.pool.len(), 1);
+    assert!(layout.pool[0].bytes.is_empty());
     assert_eq!(layout.strings.len(), 2);
     assert!(layout.strings.iter().all(|s| s.kind == StrKind::Internal));
+    assert!(layout.strings.iter().all(|s| s.pool_index == 0));
     assert!(layout.translatable_indices().is_empty());
 }
 
-/// Gated real-file test. Requires `KONKON_TEST_GAME_DIR` pointing at the
-/// 若葉色のカルテット install. Every `BurikoCompiledScript` DSC member of
-/// `data01000.arc` must disassemble without error.
+// ---------------------------------------------------------------------------
+// Gated real-file test
+// ---------------------------------------------------------------------------
+
+/// Requires `KONKON_TEST_GAME_DIR` pointing at the 若葉色のカルテット install.
+/// Every `BurikoCompiledScript` DSC member of `data01000.arc` must disassemble
+/// without error, and its recorded pool must reconstruct the original region
+/// byte-for-byte (the property Task 8's identity gate needs).
 #[test]
 #[ignore]
 fn gated_parse_all_scripts_of_data01000() {
@@ -211,22 +476,52 @@ fn gated_parse_all_scripts_of_data01000() {
             continue;
         }
         scripts += 1;
-        match parse(&decompressed) {
-            Ok(p) => {
-                parsed_ok += 1;
-                for s in &p.layout.strings {
-                    match s.kind {
-                        StrKind::Message => total_messages += 1,
-                        StrKind::CharacterName => total_names += 1,
-                        StrKind::Internal => total_internal += 1,
-                    }
-                }
+        let layout = match parse(&decompressed) {
+            Ok(p) => p.layout,
+            Err(e) => {
+                failures.push(format!("{}: parse: {e}", m.name));
+                continue;
             }
-            Err(e) => failures.push(format!("{}: parse: {e}", m.name)),
+        };
+        parsed_ok += 1;
+
+        for s in &layout.strings {
+            match s.kind {
+                StrKind::Message => total_messages += 1,
+                StrKind::CharacterName => total_names += 1,
+                StrKind::Internal => total_internal += 1,
+            }
+        }
+
+        // Pool invariants (Task 8 identity-gate prerequisites).
+        if layout.pool.is_empty() {
+            failures.push(format!("{}: empty pool", m.name));
+        }
+        for s in &layout.strings {
+            let entry = &layout.pool[s.pool_index];
+            if s.text_offset != entry.offset || s.bytes != entry.bytes {
+                failures.push(format!(
+                    "{}: string ref does not match its pool entry",
+                    m.name
+                ));
+                break;
+            }
+        }
+        let pool_start = layout.code_offset + layout.code_length;
+        let mut rebuilt = Vec::new();
+        for e in &layout.pool {
+            rebuilt.extend_from_slice(&e.bytes);
+            rebuilt.push(0);
+        }
+        rebuilt.extend_from_slice(&layout.pool_tail);
+        if rebuilt != decompressed[pool_start..] {
+            failures.push(format!(
+                "{}: pool does not reconstruct the original region",
+                m.name
+            ));
         }
 
         if m.name == "00com_12" {
-            let layout = parse(&decompressed).unwrap().layout;
             eprintln!("--- 00com_12 first 8 Message strings ---");
             for s in layout
                 .strings

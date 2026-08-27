@@ -17,11 +17,30 @@ use super::layout::StrKind;
 /// The 0x1C-byte signature at the start of every V1 script.
 pub(super) const MAGIC: &[u8] = b"BurikoCompiledScriptVer1.00\0";
 
-fn format_err(detail: impl Into<String>) -> KonkonError {
+/// Build a `KonkonError::Format { container: "script", .. }`. Shared by every
+/// read in this module and by [`super::script`].
+pub(super) fn format_err(detail: impl Into<String>) -> KonkonError {
     KonkonError::Format {
         container: "script",
         detail: detail.into(),
     }
+}
+
+/// Resolve a string-address operand (`code_offset + address`) to an absolute
+/// offset, bounds-checked against `data`. Shared by the walk and by
+/// [`super::script`].
+pub(super) fn resolve_string_address(
+    data: &[u8],
+    code_offset: usize,
+    address: i32,
+) -> Result<usize> {
+    let abs = code_offset as i64 + address as i64;
+    if abs < 0 || abs as u64 >= data.len() as u64 {
+        return Err(format_err(format!(
+            "string address {address} resolves outside the script"
+        )));
+    }
+    Ok(abs as usize)
 }
 
 /// Operand templates, verbatim from `EthornellV1Disassembler.OperandTemplates`.
@@ -393,13 +412,7 @@ impl Disassembler<'_> {
     }
 
     fn resolve_address(&self, address: i32) -> Result<usize> {
-        let abs = self.code_offset as i64 + address as i64;
-        if abs < 0 || abs as u64 >= self.data.len() as u64 {
-            return Err(format_err(format!(
-                "string address {address} resolves outside the script"
-            )));
-        }
-        Ok(abs as usize)
+        resolve_string_address(self.data, self.code_offset, address)
     }
 
     fn is_empty_string_at(&self, address: i32) -> Result<bool> {
@@ -418,7 +431,7 @@ impl Disassembler<'_> {
 }
 
 /// The zero-terminated byte string at `offset` (NUL excluded).
-pub(super) fn read_zero_terminated(data: &[u8], offset: usize) -> Result<Vec<u8>> {
+fn read_zero_terminated(data: &[u8], offset: usize) -> Result<Vec<u8>> {
     let rest = data
         .get(offset..)
         .ok_or_else(|| format_err(format!("string offset {offset} is past end of script")))?;

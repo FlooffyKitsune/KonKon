@@ -42,6 +42,11 @@ impl PlaceholderMap {
         self.0.get(k).map(|s| s.as_str())
     }
 
+    /// Iterator over placeholder index keys, in ascending string order.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(|s| s.as_str())
+    }
+
     /// Number of distinct placeholders.
     pub fn len(&self) -> usize {
         self.0.len()
@@ -67,6 +72,10 @@ impl PlaceholderMap {
 fn spans(raw: &str, spec: &ControlCodeSpec) -> Vec<(usize, usize, String)> {
     match &spec.pattern {
         ControlPattern::Literal(lit) => {
+            // An empty literal would match at every position and never advance.
+            if lit.is_empty() {
+                return Vec::new();
+            }
             let mut out = Vec::new();
             let mut from = 0;
             while let Some(rel) = raw[from..].find(lit) {
@@ -133,11 +142,15 @@ pub fn normalize(raw: &str, specs: &[ControlCodeSpec]) -> (String, PlaceholderMa
 /// Replace `{n}` placeholders in `norm` with their literal control codes.
 ///
 /// Errors with [`KonkonError::RoundTrip`] if a `{n}` token's index is not in
-/// `map`; the error's `Display` contains the offending `{n}` token.
+/// `map` (extra placeholder), or if a key present in `map` is never referenced
+/// by any `{n}` token in `norm` (missing placeholder). Reordering — every key
+/// used exactly once in a different order — is allowed. The error's `Display`
+/// contains the offending `{n}` token.
 pub fn denormalize(norm: &str, map: &PlaceholderMap) -> Result<String> {
     let re = regex::Regex::new(r"\{(\d+)\}").expect("valid placeholder regex");
     let mut out = String::with_capacity(norm.len());
     let mut last = 0;
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for m in re.captures_iter(norm) {
         let whole = m.get(0).expect("group 0 always present");
         let key = &m[1];
@@ -145,10 +158,27 @@ pub fn denormalize(norm: &str, map: &PlaceholderMap) -> Result<String> {
             file: "<line>".into(),
             detail: format!("unknown placeholder {{{key}}}"),
         })?;
+        seen.insert(key.to_string());
         out.push_str(&norm[last..whole.start()]);
         out.push_str(repl);
         last = whole.end();
     }
     out.push_str(&norm[last..]);
+
+    let missing: Vec<String> = map
+        .keys()
+        .filter(|k| !seen.contains(*k))
+        .map(|k| format!("{{{k}}}"))
+        .collect();
+    if !missing.is_empty() {
+        return Err(KonkonError::RoundTrip {
+            file: "<line>".into(),
+            detail: format!(
+                "placeholder {} missing from translated text",
+                missing.join(", ")
+            ),
+        });
+    }
+
     Ok(out)
 }

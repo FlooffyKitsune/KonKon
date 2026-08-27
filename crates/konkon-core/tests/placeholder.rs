@@ -47,6 +47,14 @@ fn translated_text_may_reorder_placeholders() {
     assert_eq!(back, r#"\n[ruby text="A"]"#);
 }
 
+#[test]
+fn denormalize_rejects_dropped_placeholder() {
+    let raw = r#"[ruby text="A"]\n"#;
+    let (_n, map) = normalize(raw, &specs()); // 2 keys: {0}, {1}
+    let err = denormalize("{0}", &map).unwrap_err(); // {1} dropped
+    assert!(err.to_string().contains("{1}"));
+}
+
 // --- Focused tests added for overlap resolution (controller note 1) ---
 
 fn overlap_specs() -> Vec<ControlCodeSpec> {

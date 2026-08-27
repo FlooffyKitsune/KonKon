@@ -547,6 +547,7 @@ dependencies = [
  "encoding_rs",
  "proptest",
  "refinery",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

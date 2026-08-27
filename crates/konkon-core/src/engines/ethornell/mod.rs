@@ -3,6 +3,7 @@
 //! Stub: real probing, extraction, and repacking land in Tasks 6-9.
 
 pub mod archive;
+pub mod dsc;
 pub mod layout;
 pub mod script;
 

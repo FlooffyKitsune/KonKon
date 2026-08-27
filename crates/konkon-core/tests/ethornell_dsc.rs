@@ -20,19 +20,19 @@ fn hash_update(hash: &mut u32) -> u32 {
     eax & 0x7FFF
 }
 
-/// Build an all-literal DSC blob.
+/// Header + obfuscated code-length table for a fixture in which every one of the
+/// 512 symbols is assigned a 9-bit code.
 ///
-/// Every one of the 512 symbols is assigned a 9-bit code, so the canonical
-/// Huffman tree is a perfect depth-9 binary tree whose leaf for symbol `s` is
-/// reached by the 9-bit big-endian value `s`. A literal byte `b` is therefore
-/// emitted as the 9 bits `0b0_bbbb_bbbb`. This exercises the table de-obfuscation,
-/// the canonical-tree builder, and the MSB-first bit reader all at once.
-fn build_all_literal_dsc(payload: &[u8], key: u32) -> Vec<u8> {
+/// The canonical Huffman tree is then a perfect depth-9 binary tree whose leaf
+/// for symbol `s` is reached by the 9-bit big-endian value `s`. Symbols `0..256`
+/// are literal bytes; symbols `256..512` are match tokens with
+/// `len = (s & 0xFF) + 2`.
+fn dsc_header_and_table(payload_size: u32, key: u32) -> Vec<u8> {
     let mut blob = Vec::new();
     blob.extend_from_slice(MAGIC); // 0x00: 16-byte signature
     blob.extend_from_slice(&key.to_le_bytes()); // 0x10: hash key
-    blob.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // 0x14: decompressed size
-    blob.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // 0x18: symbol count (unused)
+    blob.extend_from_slice(&payload_size.to_le_bytes()); // 0x14: decompressed size
+    blob.extend_from_slice(&payload_size.to_le_bytes()); // 0x18: symbol count (unused)
     blob.extend_from_slice(&0u32.to_le_bytes()); // 0x1C: padding
 
     // 0x20: 512-byte obfuscated code-length table; raw[i] = 9 + keystream_byte(i)
@@ -41,21 +41,34 @@ fn build_all_literal_dsc(payload: &[u8], key: u32) -> Vec<u8> {
         let k = (hash_update(&mut hash) & 0xFF) as u8;
         blob.push(9u8.wrapping_add(k));
     }
+    blob
+}
 
-    // 0x220: bitstream, 9 bits per payload byte, MSB-first.
-    let mut acc: u32 = 0;
+/// Pack `(value, bit_count)` pairs into a byte vector, MSB-first.
+fn pack_bits(writes: &[(u32, u32)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut acc: u64 = 0;
     let mut nbits: u32 = 0;
-    for &b in payload {
-        acc = (acc << 9) | u32::from(b); // symbol == byte value, top (9th) bit is 0
-        nbits += 9;
+    for &(val, w) in writes {
+        let mask = (1u64 << w) - 1;
+        acc = (acc << w) | (u64::from(val) & mask);
+        nbits += w;
         while nbits >= 8 {
             nbits -= 8;
-            blob.push(((acc >> nbits) & 0xFF) as u8);
+            out.push(((acc >> nbits) & 0xFF) as u8);
         }
     }
     if nbits > 0 {
-        blob.push(((acc << (8 - nbits)) & 0xFF) as u8);
+        out.push(((acc << (8 - nbits)) & 0xFF) as u8);
     }
+    out
+}
+
+/// Build an all-literal DSC blob: 9 bits per payload byte.
+fn build_all_literal_dsc(payload: &[u8], key: u32) -> Vec<u8> {
+    let mut blob = dsc_header_and_table(payload.len() as u32, key);
+    let writes: Vec<(u32, u32)> = payload.iter().map(|&b| (u32::from(b), 9)).collect();
+    blob.extend_from_slice(&pack_bits(&writes));
     blob
 }
 
@@ -73,6 +86,49 @@ fn decompress_all_literal_roundtrip_zero_key() {
     let blob = build_all_literal_dsc(payload, 0);
     let out = decompress(&blob).expect("decompress should succeed");
     assert_eq!(out.as_slice(), payload.as_slice());
+}
+
+#[test]
+fn decompress_back_reference_self_overlapping_copy() {
+    // Emit literals 'a','b', then a match token: symbol 258 => len = (258 & 0xFF)
+    // + 2 = 4; 12-bit offset field 0 => off = 0 + 2 = 2. Copying 4 bytes from
+    // `out[dst-2..]` self-overlaps (the 3rd/4th copied bytes read slots written
+    // earlier in the same token), yielding "ababab".
+    let mut blob = dsc_header_and_table(6, 0);
+    blob.extend_from_slice(&pack_bits(&[
+        (u32::from(b'a'), 9),
+        (u32::from(b'b'), 9),
+        (258, 9), // match symbol, len 4
+        (0, 12),  // offset field -> off 2
+    ]));
+    let out = decompress(&blob).expect("decompress should succeed");
+    assert_eq!(out.as_slice(), b"ababab".as_slice());
+}
+
+#[test]
+fn decompress_back_reference_reads_zero_before_window_start() {
+    // Literal 'a' (dst_ptr = 1), then a match token: symbol 256 => len 2; 12-bit
+    // offset field 3 => off = 5. `dst_ptr - off = -4`, so both copied bytes come
+    // from before the start of the output window and read as 0.
+    let mut blob = dsc_header_and_table(3, 0);
+    blob.extend_from_slice(&pack_bits(&[
+        (u32::from(b'a'), 9),
+        (256, 9), // match symbol, len 2
+        (3, 12),  // offset field -> off 5
+    ]));
+    let out = decompress(&blob).expect("decompress should succeed");
+    assert_eq!(out.as_slice(), b"a\0\0".as_slice());
+}
+
+#[test]
+fn decompress_rejects_implausible_size() {
+    let mut blob = dsc_header_and_table(0, 0);
+    blob[0x14..0x18].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    blob.extend_from_slice(&[0u8; 8]);
+    let err = decompress(&blob).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("dsc"), "got: {msg}");
+    assert!(msg.contains("implausible"), "got: {msg}");
 }
 
 #[test]

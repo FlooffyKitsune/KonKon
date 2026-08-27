@@ -29,6 +29,12 @@ const TABLE_LEN: usize = 512;
 const BITSTREAM_START: usize = HEADER_LEN + TABLE_LEN; // 0x220
 /// Upper bound on Huffman node / work-vector indices (512 leaves + internals).
 const NODE_CAP: usize = 1024;
+/// Hard ceiling on the header-declared decompressed size. The field is an
+/// attacker-controllable `u32`; real BGI scripts are well under 10 MiB, so this
+/// leaves ample headroom while preventing a corrupt member from driving a
+/// multi-gigabyte allocation (which aborts the process on Windows rather than
+/// returning an error).
+const MAX_DECOMPRESSED: usize = 128 * 1024 * 1024;
 
 fn format_err(detail: impl Into<String>) -> KonkonError {
     KonkonError::Format {
@@ -121,11 +127,10 @@ impl Tree {
                     .get(read_ptr)
                     .ok_or_else(|| format_err("huffman leaf index out of range"))?
                     as usize;
-                let has = tree
-                    .has_childs
-                    .get_mut(node)
-                    .ok_or_else(|| format_err("huffman node index out of range"))?;
-                *has = false;
+                if node >= NODE_CAP {
+                    return Err(format_err("huffman node index out of range"));
+                }
+                tree.has_childs[node] = false;
                 tree.leaf_value[node] = buffer[bc] & 0x1FF;
                 bc += 1;
                 read_ptr += 1;
@@ -200,6 +205,12 @@ pub fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
 
     let mut hash = u32::from_le_bytes(bytes[0x10..0x14].try_into().unwrap());
     let out_size = u32::from_le_bytes(bytes[0x14..0x18].try_into().unwrap()) as usize;
+
+    if out_size > MAX_DECOMPRESSED {
+        return Err(format_err(format!(
+            "implausible decompressed size {out_size} (cap {MAX_DECOMPRESSED})"
+        )));
+    }
 
     let tree = Tree::build(table, &mut hash)?;
 

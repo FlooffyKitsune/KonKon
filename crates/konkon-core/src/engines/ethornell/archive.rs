@@ -33,7 +33,10 @@ pub fn read_arc(bytes: &[u8]) -> Result<Vec<Member>> {
     let mut members = Vec::with_capacity(count);
     for i in 0..count {
         let e = INDEX_START + i * ENTRY_SIZE;
-        let name_bytes = &bytes[e..e + NAME_LEN];
+        let name_bytes = bytes.get(e..e + NAME_LEN).ok_or(KonkonError::Format {
+            container: "arc",
+            detail: format!("truncated index entry at {e}"),
+        })?;
         let end = name_bytes.iter().position(|&c| c == 0).unwrap_or(NAME_LEN);
         let (name, _, _) = SHIFT_JIS.decode(&name_bytes[..end]);
         let off = read_u32(bytes, e + NAME_LEN)? as usize;

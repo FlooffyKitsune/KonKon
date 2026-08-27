@@ -57,3 +57,14 @@ fn read_arc_rejects_bad_magic() {
     let err = read_arc(b"NOPE________\0\0\0\0").unwrap_err();
     assert!(err.to_string().contains("BURIKO") || err.to_string().contains("magic"));
 }
+
+#[test]
+fn read_arc_rejects_truncated_index() {
+    // header claims 4 members but the buffer is cut off inside the first entry
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"BURIKO ARC20");
+    blob.extend_from_slice(&4u32.to_le_bytes());
+    blob.extend_from_slice(&[0u8; 0x20]); // only part of one 0x80 entry
+    let err = read_arc(&blob).unwrap_err();
+    assert!(err.to_string().contains("truncat") || err.to_string().contains("arc"));
+}

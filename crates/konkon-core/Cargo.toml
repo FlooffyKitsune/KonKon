@@ -18,3 +18,4 @@ refinery.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true
+encoding_rs.workspace = true

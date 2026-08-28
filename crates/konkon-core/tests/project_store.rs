@@ -27,10 +27,7 @@ fn create_refuses_to_clobber_an_existing_project() {
         Ok(_) => panic!("expected create to fail on an existing project"),
         Err(e) => e,
     };
-    assert!(
-        err.to_string().contains("already exists"),
-        "got: {err}"
-    );
+    assert!(err.to_string().contains("already exists"), "got: {err}");
     assert_eq!(
         std::fs::read_to_string(first.root.join("config.toml")).unwrap(),
         "engine_id = 'ethornell'\n",

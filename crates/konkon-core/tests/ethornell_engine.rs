@@ -340,11 +340,10 @@ fn repack_allows_identical_translations_for_a_shared_pool_string() {
     setup_shared_pool_game(tmp.path());
     let work = tempdir().unwrap();
 
-    let patches =
-        repack_files_from_extract(tmp.path(), work.path(), |ord, jp| match ord {
-            1 | 2 => "Same".to_string(),
-            _ => jp.to_string(),
-        });
+    let patches = repack_files_from_extract(tmp.path(), work.path(), |ord, jp| match ord {
+        1 | 2 => "Same".to_string(),
+        _ => jp.to_string(),
+    });
     let members = read_arc(&patches[0].bytes).unwrap();
     let layout = parse(&members[0].data).unwrap().layout;
     let tix = layout.translatable_indices();

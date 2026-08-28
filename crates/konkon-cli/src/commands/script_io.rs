@@ -67,21 +67,20 @@ pub fn import(project: &Path, jsonl: &Path) -> anyhow::Result<()> {
             if raw.trim().is_empty() {
                 continue;
             }
-            let line: Line = serde_json::from_str(raw)
-                .map_err(|e| konkon_core::KonkonError::Other(format!(
-                    "{}:{}: {e}",
-                    jsonl.display(),
-                    lineno + 1
-                )))?;
+            let line: Line = serde_json::from_str(raw).map_err(|e| {
+                konkon_core::KonkonError::Other(format!("{}:{}: {e}", jsonl.display(), lineno + 1))
+            })?;
             if line.en.is_empty() {
                 continue;
             }
             let unit_id = unit_ids
                 .get(&(line.file.clone(), line.ordinal))
-                .ok_or_else(|| konkon_core::KonkonError::Other(format!(
-                    "unknown unit: ordinal {} in {}",
-                    line.ordinal, line.file
-                )))?;
+                .ok_or_else(|| {
+                    konkon_core::KonkonError::Other(format!(
+                        "unknown unit: ordinal {} in {}",
+                        line.ordinal, line.file
+                    ))
+                })?;
             store.upsert_translation(*unit_id, &line.en, "human", "human")?;
             n += 1;
         }

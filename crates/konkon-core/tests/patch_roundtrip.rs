@@ -129,7 +129,10 @@ fn rebuild_after_apply_keeps_the_true_original_hash_via_the_backup() {
     );
 
     revert(&proj, game.path()).unwrap();
-    assert_eq!(std::fs::read(game.path().join("a.bin")).unwrap(), b"ORIGINAL");
+    assert_eq!(
+        std::fs::read(game.path().join("a.bin")).unwrap(),
+        b"ORIGINAL"
+    );
 }
 
 #[test]

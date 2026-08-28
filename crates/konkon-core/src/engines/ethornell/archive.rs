@@ -99,12 +99,10 @@ pub fn read_arc(bytes: &[u8]) -> Result<Vec<Member>> {
             })?
             .try_into()
             .unwrap();
-        let start = data_start
-            .checked_add(off)
-            .ok_or(KonkonError::Format {
-                container: "arc",
-                detail: format!("member '{name}' offset overflows"),
-            })?;
+        let start = data_start.checked_add(off).ok_or(KonkonError::Format {
+            container: "arc",
+            detail: format!("member '{name}' offset overflows"),
+        })?;
         let slice = start
             .checked_add(size)
             .and_then(|s_end| bytes.get(start..s_end))

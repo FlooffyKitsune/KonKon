@@ -174,6 +174,34 @@ fn layout_json_roundtrips() {
     assert_eq!(back, layout);
 }
 
+#[test]
+fn layout_json_is_compact_and_base64_not_byte_arrays() {
+    let fx = build_fixture();
+    let layout = parse(&fx.bytes).unwrap().layout;
+    let json = layout.to_json().unwrap();
+    // compact: no pretty-print newline+indent
+    assert!(!json.contains("\n  "), "expected compact JSON");
+    // prefix is base64 of MAGIC + header + code, which starts "BurikoCompiled..."
+    // -> base64 begins "QnVyaWtv"
+    assert!(
+        json.contains("\"prefix\":\"QnVyaWtv"),
+        "prefix should be base64: {json}"
+    );
+    // pool entry bytes are a base64 string, e.g. "bytes":"..." (not an array)
+    assert!(
+        !json.contains("\"bytes\":["),
+        "no raw numeric byte arrays: {json}"
+    );
+    // the redundant per-string-ref `bytes` is dropped: `strings` holds only
+    // operand_offset/text_offset/pool_index/kind, so `bytes` appears exactly
+    // once per pool entry and never inside a strings[] object.
+    let strings_section = &json[json.find("\"strings\":").unwrap()..];
+    assert!(
+        !strings_section.contains("\"bytes\""),
+        "string refs must not serialize `bytes`: {strings_section}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Individual walk behaviors
 // ---------------------------------------------------------------------------

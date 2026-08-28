@@ -12,6 +12,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 
+/// serde adapter: encode a `Vec<u8>` as a base64 string instead of a JSON array
+/// of numbers. Roughly a 4x size cut for the byte-heavy `prefix` / pool fields.
+mod b64 {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(v))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        STANDARD.decode(s).map_err(serde::de::Error::custom)
+    }
+}
+
 /// How a pool string is used, which decides whether it is translated.
 ///
 /// Mirrors VNTextPatch's `ScriptStringType`.
@@ -37,7 +53,8 @@ impl StrKind {
 pub struct PoolEntry {
     /// Absolute offset of the string's first byte in the decompressed script.
     pub offset: usize,
-    /// The CP932 bytes of the string, NUL excluded.
+    /// The CP932 bytes of the string, NUL excluded. Serialized as base64.
+    #[serde(with = "b64")]
     pub bytes: Vec<u8>,
 }
 
@@ -55,8 +72,10 @@ pub struct ScriptStringRef {
     pub pool_index: usize,
     /// Classification driving translate-vs-preserve.
     pub kind: StrKind,
-    /// The zero-terminated CP932 bytes at `text_offset`, NUL excluded, captured
-    /// at parse time. Always equal to `pool[pool_index].bytes`.
+    /// The zero-terminated CP932 bytes at `text_offset`, NUL excluded. Always
+    /// equal to `pool[pool_index].bytes`; not serialized (it is pure
+    /// duplication) and rehydrated from the pool by [`ScriptLayout::from_json`].
+    #[serde(skip)]
     pub bytes: Vec<u8>,
 }
 
@@ -69,6 +88,8 @@ pub struct ScriptLayout {
     pub code_length: usize,
     /// The script bytes `[0, code_offset + code_length)`, copied verbatim on a
     /// rebuild (header + bytecode, including any embedded message records).
+    /// Serialized as base64.
+    #[serde(with = "b64")]
     pub prefix: Vec<u8>,
     /// The original string pool `[code_offset + code_length .. EOF)` split on
     /// NUL, in file order. Every referenced string is one of these entries.
@@ -82,14 +103,23 @@ pub struct ScriptLayout {
 }
 
 impl ScriptLayout {
-    /// Serialize to pretty JSON.
+    /// Serialize to compact JSON.
     pub fn to_json(&self) -> Result<String> {
-        Ok(serde_json::to_string_pretty(self)?)
+        Ok(serde_json::to_string(self)?)
     }
 
-    /// Deserialize from JSON produced by [`ScriptLayout::to_json`].
+    /// Deserialize from JSON produced by [`ScriptLayout::to_json`], rehydrating
+    /// each string ref's `bytes` (not serialized) from its pool entry.
     pub fn from_json(s: &str) -> Result<Self> {
-        Ok(serde_json::from_str(s)?)
+        let mut layout: Self = serde_json::from_str(s)?;
+        let ScriptLayout { pool, strings, .. } = &mut layout;
+        for sref in strings.iter_mut() {
+            sref.bytes = pool
+                .get(sref.pool_index)
+                .map(|e| e.bytes.clone())
+                .unwrap_or_default();
+        }
+        Ok(layout)
     }
 
     /// Indices into [`ScriptLayout::strings`] whose `kind` is translatable, in

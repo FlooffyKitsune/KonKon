@@ -12,8 +12,12 @@ path = "src/main.rs"
 konkon-core = { path = "../konkon-core" }
 clap.workspace = true
 anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
+serde_json.workspace = true
+encoding_rs.workspace = true

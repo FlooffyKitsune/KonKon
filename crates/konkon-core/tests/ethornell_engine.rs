@@ -86,11 +86,7 @@ const ARC_STEM: &str = "data01";
 /// raw script bytes stored as that member.
 fn setup_game_dir(dir: &std::path::Path) -> Vec<u8> {
     let script = build_script_bytes();
-    let arc = build_arc(&[Member {
-        name: MEMBER_NAME.to_string(),
-        data: script.clone(),
-    }])
-    .expect("build_arc");
+    let arc = build_arc(&[Member::new(MEMBER_NAME, script.clone())]).expect("build_arc");
     std::fs::write(dir.join(format!("{ARC_STEM}.arc")), &arc).expect("write arc");
     script
 }
@@ -171,11 +167,7 @@ fn extract_normalizes_ruby_control_codes() {
     let script = assemble(&code, &[&name, &message]);
 
     let tmp = tempdir().unwrap();
-    let arc = build_arc(&[Member {
-        name: MEMBER_NAME.to_string(),
-        data: script,
-    }])
-    .unwrap();
+    let arc = build_arc(&[Member::new(MEMBER_NAME, script)]).unwrap();
     std::fs::write(tmp.path().join(format!("{ARC_STEM}.arc")), arc).unwrap();
 
     let work = tempdir().unwrap();

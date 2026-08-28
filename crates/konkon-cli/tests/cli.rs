@@ -72,10 +72,7 @@ fn synth_script(name: &str, message: &str) -> Vec<u8> {
 fn synth_arc(members: &[(&str, &[u8])]) -> Vec<u8> {
     let members: Vec<Member> = members
         .iter()
-        .map(|(name, data)| Member {
-            name: (*name).to_string(),
-            data: data.to_vec(),
-        })
+        .map(|(name, data)| Member::new(*name, data.to_vec()))
         .collect();
     build_arc(&members).expect("build_arc")
 }

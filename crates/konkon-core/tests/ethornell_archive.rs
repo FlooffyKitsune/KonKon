@@ -59,6 +59,54 @@ fn read_arc_rejects_bad_magic() {
 }
 
 #[test]
+fn read_arc_rejects_absurd_entry_count_without_aborting() {
+    // 76-byte archive whose header claims 0xFFFFFFFF entries. The old code did
+    // `Vec::with_capacity(0xFFFFFFFF)` and aborted the process.
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"BURIKO ARC20");
+    blob.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    blob.extend_from_slice(&[0u8; 60]); // pad to 76 bytes
+    assert_eq!(blob.len(), 76);
+    let err = read_arc(&blob).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("entries") || msg.contains("overflow"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn build_arc_preserves_reserved_bytes_and_exact_name_field() {
+    // One entry with a multi-byte CP932 name and non-zero reserved bytes.
+    let name = "配役/芳乃.bin";
+    let (enc, _, had_err) = encoding_rs::SHIFT_JIS.encode(name);
+    assert!(!had_err);
+    let data: &[u8] = b"SOME BODY BYTES";
+
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"BURIKO ARC20");
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    let mut name_field = vec![0u8; 0x60];
+    name_field[..enc.len()].copy_from_slice(&enc);
+    // trailing garbage after the NUL terminator, to prove it round-trips
+    name_field[enc.len() + 1] = 0x7F;
+    blob.extend_from_slice(&name_field);
+    blob.extend_from_slice(&0u32.to_le_bytes()); // offset
+    blob.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    let reserved: [u8; 0x18] = std::array::from_fn(|i| (i as u8) ^ 0xA5);
+    blob.extend_from_slice(&reserved);
+    blob.extend_from_slice(data);
+
+    let members = read_arc(&blob).unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].reserved, reserved);
+    assert_eq!(members[0].data, data);
+
+    let rebuilt = build_arc(&members).unwrap();
+    assert_eq!(rebuilt, blob, "byte-faithful round-trip");
+}
+
+#[test]
 fn read_arc_rejects_truncated_index() {
     // header claims 4 members but the buffer is cut off inside the first entry
     let mut blob = Vec::new();

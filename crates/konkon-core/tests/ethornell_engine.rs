@@ -277,6 +277,81 @@ fn repack_unchanged_unit_is_left_as_original() {
     assert_eq!(layout.strings[tix[1]].bytes, b"changed");
 }
 
+/// Choice screen where two translatable operands point at the same pool string
+/// (`push_str C0; push_str C1; push_str C1; show_choice; terminate`). Ordinals 1
+/// and 2 share one `pool_index`.
+fn setup_shared_pool_game(dir: &std::path::Path) {
+    let c0 = sjis("A");
+    let c1 = sjis("B");
+    let pool_lens = [c0.len(), c1.len()];
+    let code_len = 8 * 3 + 4 + 4;
+    let mut code = Vec::new();
+    push_str(&mut code, addr_of(code_len, &pool_lens, 0));
+    push_str(&mut code, addr_of(code_len, &pool_lens, 1));
+    push_str(&mut code, addr_of(code_len, &pool_lens, 1));
+    push_i32(&mut code, 0x0160);
+    push_i32(&mut code, 0x001B);
+    let script = assemble(&code, &[&c0, &c1]);
+    let arc = build_arc(&[Member::new(MEMBER_NAME, script)]).unwrap();
+    std::fs::write(dir.join(format!("{ARC_STEM}.arc")), arc).unwrap();
+}
+
+#[test]
+fn repack_rejects_conflicting_translations_for_a_shared_pool_string() {
+    let tmp = tempdir().unwrap();
+    setup_shared_pool_game(tmp.path());
+    let work = tempdir().unwrap();
+
+    let ex = EthornellEngine.extract(tmp.path(), work.path()).unwrap();
+    let f = &ex.files[0];
+    let units: Vec<RepackUnit> = f
+        .units
+        .iter()
+        .map(|u| RepackUnit {
+            ordinal: u.ordinal,
+            jp_norm: u.jp_norm.clone(),
+            en_norm: match u.ordinal {
+                1 => "First".to_string(),
+                2 => "Second".to_string(),
+                _ => u.jp_norm.clone(),
+            },
+            placeholder_map_json: u.placeholders.to_json(),
+        })
+        .collect();
+    let ctx = RepackCtx {
+        game_dir: tmp.path(),
+        work_dir: work.path(),
+        files: vec![RepackFile {
+            rel_path: f.rel_path.clone(),
+            layout_json: f.layout_json.clone(),
+            units,
+        }],
+    };
+    let err = EthornellEngine.repack(&ctx).unwrap_err();
+    assert!(
+        err.to_string().contains("different translations"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn repack_allows_identical_translations_for_a_shared_pool_string() {
+    let tmp = tempdir().unwrap();
+    setup_shared_pool_game(tmp.path());
+    let work = tempdir().unwrap();
+
+    let patches =
+        repack_files_from_extract(tmp.path(), work.path(), |ord, jp| match ord {
+            1 | 2 => "Same".to_string(),
+            _ => jp.to_string(),
+        });
+    let members = read_arc(&patches[0].bytes).unwrap();
+    let layout = parse(&members[0].data).unwrap().layout;
+    let tix = layout.translatable_indices();
+    assert_eq!(layout.strings[tix[1]].bytes, b"Same");
+    assert_eq!(layout.strings[tix[2]].bytes, b"Same");
+}
+
 // ---------------------------------------------------------------------------
 // Gated real-file round-trip (Step 5)
 // ---------------------------------------------------------------------------

@@ -256,7 +256,20 @@ impl Engine for EthornellEngine {
                             stem, unit.ordinal
                         )));
                     }
-                    replacements.insert(sref.pool_index, encoded.into_owned());
+                    let encoded = encoded.into_owned();
+                    if let Some(existing) = replacements.get(&sref.pool_index) {
+                        if existing != &encoded {
+                            return Err(KonkonError::Format {
+                                container: "script",
+                                detail: format!(
+                                    "{stem}/{member_name}: two units share pooled string \
+                                     {} but were given different translations",
+                                    sref.pool_index
+                                ),
+                            });
+                        }
+                    }
+                    replacements.insert(sref.pool_index, encoded);
                 }
 
                 let rebuilt = script::rebuild(&layout, &replacements)?;

@@ -6,7 +6,7 @@
 //! bind every emitted string reference to its pool entry. The input must be the
 //! *decompressed* script bytes (post-`dsc::decompress`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::Result;
 
@@ -103,6 +103,98 @@ pub fn parse(decompressed: &[u8]) -> Result<ParsedScript> {
             strings,
         },
     })
+}
+
+/// Rebuild a decompressed V1 script with translated string-pool entries.
+///
+/// `replacements` maps a `pool_index` (an index into [`ScriptLayout::pool`]) to
+/// the new CP932 bytes for that entry (NUL excluded). Only a `pool_index`
+/// referenced by at least one non-[`StrKind::Internal`](super::layout::StrKind)
+/// [`ScriptStringRef`] may appear. A missing key keeps `pool[i].bytes`
+/// unchanged. No deduplication is performed: the pool is emitted in original
+/// order so `rebuild(layout, &BTreeMap::new())` reproduces the input decompressed
+/// script byte-for-byte.
+///
+/// The returned bytes are the rebuilt **decompressed** script (not DSC).
+///
+/// # Errors
+///
+/// [`crate::KonkonError::Format`] with `container: "script"` if a replacement
+/// value contains a NUL byte, if a key is not referenced by any non-`Internal`
+/// string reference (including keys outside the pool range), or if an operand
+/// rewrite would fall outside the copied prefix. Never panics.
+pub fn rebuild(layout: &ScriptLayout, replacements: &BTreeMap<usize, Vec<u8>>) -> Result<Vec<u8>> {
+    // pool_index values that appear on at least one translatable string ref.
+    let translatable: HashSet<usize> = layout
+        .strings
+        .iter()
+        .filter(|s| s.kind.is_translatable())
+        .map(|s| s.pool_index)
+        .collect();
+
+    for (&key, value) in replacements {
+        if !translatable.contains(&key) {
+            return Err(format_err(format!(
+                "replacement key {key} is not referenced by any translatable \
+                 (non-Internal) string"
+            )));
+        }
+        if value.contains(&0) {
+            return Err(format_err(format!(
+                "replacement for pool index {key} contains a NUL byte"
+            )));
+        }
+    }
+
+    // 1. Emit the new pool by walking `layout.pool` in original order.
+    let pool_base = layout
+        .code_offset
+        .checked_add(layout.code_length)
+        .ok_or_else(|| format_err("code_offset + code_length overflow"))?;
+    let mut pool_out: Vec<u8> = Vec::new();
+    let mut new_offset: Vec<usize> = Vec::with_capacity(layout.pool.len());
+    for (i, entry) in layout.pool.iter().enumerate() {
+        let text = replacements.get(&i).unwrap_or(&entry.bytes);
+        new_offset.push(pool_base + pool_out.len());
+        pool_out.extend_from_slice(text);
+        pool_out.push(0);
+    }
+    pool_out.extend_from_slice(&layout.pool_tail);
+
+    // 2. Copy the prefix (header + bytecode) verbatim.
+    let mut out = layout.prefix.clone();
+
+    // 3. Repatch every string-address operand (including Internal refs).
+    for s in &layout.strings {
+        let abs = *new_offset.get(s.pool_index).ok_or_else(|| {
+            format_err(format!(
+                "string ref points at pool_index {} but the pool has {} entries",
+                s.pool_index,
+                new_offset.len()
+            ))
+        })?;
+        let rel = abs
+            .checked_sub(layout.code_offset)
+            .ok_or_else(|| format_err("rebuilt string offset precedes code_offset"))?;
+        let rel = u32::try_from(rel)
+            .map_err(|_| format_err("rebuilt string offset exceeds u32 range"))?;
+        let end = s
+            .operand_offset
+            .checked_add(4)
+            .ok_or_else(|| format_err("operand offset + 4 overflow"))?;
+        let out_len = out.len();
+        let slot = out.get_mut(s.operand_offset..end).ok_or_else(|| {
+            format_err(format!(
+                "operand offset {} is outside the copied prefix ({out_len} bytes)",
+                s.operand_offset,
+            ))
+        })?;
+        slot.copy_from_slice(&rel.to_le_bytes());
+    }
+
+    // 4. Append the rebuilt pool.
+    out.extend_from_slice(&pool_out);
+    Ok(out)
 }
 
 /// Split `data[pool_start..]` into zero-terminated entries plus any trailing

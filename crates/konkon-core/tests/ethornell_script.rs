@@ -7,8 +7,10 @@
 use konkon_core::engines::ethornell::archive::read_arc;
 use konkon_core::engines::ethornell::dsc::{decompress, is_dsc};
 use konkon_core::engines::ethornell::layout::{ScriptLayout, StrKind};
-use konkon_core::engines::ethornell::script::parse;
+use konkon_core::engines::ethornell::script::{parse, rebuild};
 use konkon_core::KonkonError;
+use proptest::prelude::*;
+use std::collections::BTreeMap;
 
 const MAGIC: &[u8] = b"BurikoCompiledScriptVer1.00\0";
 /// `magic.len() (0x1C) + header_size (4)` — every fixture uses `header_size = 4`
@@ -435,6 +437,191 @@ fn empty_string_at_message_address_is_internal() {
 }
 
 // ---------------------------------------------------------------------------
+// Task 8: rebuild (operand repatch + pool rebuild)
+// ---------------------------------------------------------------------------
+
+/// Choice-screen fixture where the third choice reuses the second choice's pool
+/// address, so two `ScriptStringRef`s share one `pool_index`.
+///
+/// ```text
+///   push_str C0        ; pool entry 0
+///   push_str C1        ; pool entry 1
+///   push_str C1        ; pool entry 1 again (shared)
+///   0x0160 show choice ; pops all three as Message
+///   0x001B terminate
+/// ```
+fn build_shared_index_fixture() -> Vec<u8> {
+    let c0: &[u8] = b"AA";
+    let c1: &[u8] = b"BB";
+    let pool_lens = [c0.len(), c1.len()];
+    let code_len = 8 * 3 + 4 + 4;
+
+    let mut code = Vec::new();
+    push_str(&mut code, addr_of(code_len, &pool_lens, 0));
+    push_str(&mut code, addr_of(code_len, &pool_lens, 1));
+    push_str(&mut code, addr_of(code_len, &pool_lens, 1));
+    push_i32(&mut code, 0x0160);
+    push_i32(&mut code, 0x001B);
+    assert_eq!(code.len(), code_len);
+
+    assemble(&code, &[c0, c1])
+}
+
+#[test]
+fn rebuild_with_no_replacements_is_byte_identical() {
+    let fx = build_fixture();
+    let layout = parse(&fx.bytes).unwrap().layout;
+    let out = rebuild(&layout, &BTreeMap::new()).expect("rebuild");
+    assert_eq!(out, fx.bytes);
+}
+
+#[test]
+fn rebuild_longer_replacement_roundtrips_via_parse() {
+    let fx = build_fixture();
+    let layout = parse(&fx.bytes).unwrap().layout;
+    // strings[1] is the Message; its pool_index is 1.
+    let new_msg = sjis("「これはずっと長い差し替えメッセージです」");
+    let mut repl = BTreeMap::new();
+    repl.insert(1usize, new_msg.clone());
+
+    let out = rebuild(&layout, &repl).expect("rebuild");
+    let re = parse(&out).expect("re-parse").layout;
+
+    assert_eq!(re.strings.len(), 3);
+    assert_eq!(re.strings[0].bytes, fx.name);
+    assert_eq!(re.strings[1].kind, StrKind::Message);
+    assert_eq!(re.strings[1].bytes, new_msg);
+    assert_eq!(re.strings[2].bytes, fx.voice);
+    // Every operand still resolves onto a pool boundary (parse would have failed
+    // otherwise); check the Internal voice ref shifted too.
+    for s in &re.strings {
+        assert_eq!(s.text_offset, re.pool[s.pool_index].offset);
+    }
+}
+
+#[test]
+fn rebuild_shorter_replacement_roundtrips_via_parse() {
+    let fx = build_fixture();
+    let layout = parse(&fx.bytes).unwrap().layout;
+    let new_msg = sjis("短い");
+    let mut repl = BTreeMap::new();
+    repl.insert(1usize, new_msg.clone());
+
+    let out = rebuild(&layout, &repl).expect("rebuild");
+    let re = parse(&out).expect("re-parse").layout;
+
+    assert_eq!(re.strings[1].bytes, new_msg);
+    assert_eq!(re.strings[2].bytes, fx.voice);
+    for s in &re.strings {
+        assert_eq!(s.text_offset, re.pool[s.pool_index].offset);
+    }
+}
+
+#[test]
+fn rebuild_rejects_nul_in_replacement_value() {
+    let fx = build_fixture();
+    let layout = parse(&fx.bytes).unwrap().layout;
+    let mut repl = BTreeMap::new();
+    repl.insert(1usize, b"has\0nul".to_vec());
+    assert_script_format_err(rebuild(&layout, &repl).unwrap_err());
+}
+
+#[test]
+fn rebuild_rejects_internal_only_pool_index() {
+    let fx = build_fixture();
+    let layout = parse(&fx.bytes).unwrap().layout;
+    // pool_index 2 is "_PlayVoice", referenced only by an Internal ref.
+    let mut repl = BTreeMap::new();
+    repl.insert(2usize, b"nope".to_vec());
+    assert_script_format_err(rebuild(&layout, &repl).unwrap_err());
+}
+
+#[test]
+fn rebuild_rejects_key_outside_pool_range() {
+    let fx = build_fixture();
+    let layout = parse(&fx.bytes).unwrap().layout;
+    let mut repl = BTreeMap::new();
+    repl.insert(99usize, b"nope".to_vec());
+    assert_script_format_err(rebuild(&layout, &repl).unwrap_err());
+}
+
+#[test]
+fn rebuild_repatches_every_operand_sharing_a_pool_index() {
+    let bytes = build_shared_index_fixture();
+    let layout = parse(&bytes).unwrap().layout;
+
+    assert_eq!(layout.strings.len(), 3);
+    assert_eq!(
+        layout
+            .strings
+            .iter()
+            .map(|s| s.pool_index)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 1]
+    );
+
+    // Grow entry 0 so entry 1's offset moves; both refs to entry 1 must follow.
+    let mut repl = BTreeMap::new();
+    repl.insert(0usize, b"AAAAAAAA".to_vec());
+    let out = rebuild(&layout, &repl).expect("rebuild");
+
+    // The two operands for pool_index 1 must hold the same (updated) address.
+    let o1 = layout.strings[1].operand_offset;
+    let o2 = layout.strings[2].operand_offset;
+    let a1 = u32::from_le_bytes(out[o1..o1 + 4].try_into().unwrap());
+    let a2 = u32::from_le_bytes(out[o2..o2 + 4].try_into().unwrap());
+    assert_eq!(a1, a2);
+    assert_ne!(
+        a1,
+        layout.strings[1].text_offset as u32 - layout.code_offset as u32
+    );
+
+    let re = parse(&out).expect("re-parse").layout;
+    assert_eq!(re.strings[0].bytes, b"AAAAAAAA");
+    assert_eq!(re.strings[1].bytes, b"BB");
+    assert_eq!(re.strings[2].bytes, b"BB");
+    assert_eq!(re.strings[1].pool_index, re.strings[2].pool_index);
+}
+
+proptest! {
+    /// Random ASCII replacements for a random subset of translatable indices of
+    /// the minimal fixture round-trip through `parse(rebuild(..))`.
+    #[test]
+    fn prop_random_replacements_roundtrip(
+        subset in proptest::collection::vec(any::<bool>(), 2),
+        texts in proptest::collection::vec("[A-Za-z0-9 ]{0,40}", 2),
+    ) {
+        let fx = build_fixture();
+        let layout = parse(&fx.bytes).unwrap().layout;
+        let tix = layout.translatable_indices(); // -> strings indices [0, 1]
+
+        let mut repl: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+        let mut expected: Vec<Vec<u8>> = layout
+            .pool
+            .iter()
+            .map(|e| e.bytes.clone())
+            .collect();
+        for (k, &si) in tix.iter().enumerate() {
+            if subset[k] {
+                let pi = layout.strings[si].pool_index;
+                let bytes = texts[k].clone().into_bytes();
+                repl.insert(pi, bytes.clone());
+                expected[pi] = bytes;
+            }
+        }
+
+        let out = rebuild(&layout, &repl).expect("rebuild");
+        let re = parse(&out).expect("re-parse").layout;
+
+        prop_assert_eq!(re.strings.len(), layout.strings.len());
+        for s in &re.strings {
+            prop_assert_eq!(&s.bytes, &expected[s.pool_index]);
+            prop_assert_eq!(s.text_offset, re.pool[s.pool_index].offset);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Gated real-file test
 // ---------------------------------------------------------------------------
 
@@ -547,5 +734,64 @@ fn gated_parse_all_scripts_of_data01000() {
     assert!(
         total_messages > 5000,
         "expected > 5000 Message strings, got {total_messages}"
+    );
+}
+
+/// Phase-0 script-level round-trip gate. For every parseable `BurikoCompiledScript`
+/// DSC member of `data01000.arc`: `decompress` -> `parse` -> `rebuild(&empty)` must
+/// be **byte-identical** to the decompressed original.
+#[test]
+#[ignore]
+fn gated_rebuild_identity_all_scripts_of_data01000() {
+    let dir = std::env::var("KONKON_TEST_GAME_DIR")
+        .expect("set KONKON_TEST_GAME_DIR to the game install directory");
+    let arc_path = std::path::Path::new(&dir).join("data01000.arc");
+    let bytes = std::fs::read(&arc_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", arc_path.display()));
+    let members = read_arc(&bytes).expect("read_arc(data01000.arc)");
+
+    let mut checked = 0usize;
+    let mut identical = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
+    for m in &members {
+        if !is_dsc(&m.data) {
+            continue;
+        }
+        let decompressed = match decompress(&m.data) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if !decompressed.starts_with(b"BurikoCompiledScriptVer1.00") {
+            continue;
+        }
+        let layout = match parse(&decompressed) {
+            Ok(p) => p.layout,
+            Err(_) => continue,
+        };
+        checked += 1;
+        let rebuilt = rebuild(&layout, &BTreeMap::new()).expect("rebuild(&empty)");
+        if rebuilt == decompressed {
+            identical += 1;
+        } else {
+            let at = rebuilt
+                .iter()
+                .zip(&decompressed)
+                .position(|(a, b)| a != b)
+                .unwrap_or_else(|| decompressed.len().min(rebuilt.len()));
+            failures.push(format!(
+                "{}: diverges at byte {at} (len rebuilt {} vs original {})",
+                m.name,
+                rebuilt.len(),
+                decompressed.len()
+            ));
+        }
+    }
+
+    eprintln!("rebuild identity: {identical}/{checked} byte-identical");
+    assert!(failures.is_empty(), "non-identical rebuilds: {failures:#?}");
+    assert!(
+        checked >= 170,
+        "expected >= 170 scripts checked, got {checked}"
     );
 }

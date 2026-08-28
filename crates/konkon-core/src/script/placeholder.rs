@@ -12,14 +12,35 @@
 
 use crate::{KonkonError, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{LazyLock, Mutex};
+
+/// Compiled-regex cache for [`ControlPattern::Regex`] specs, keyed on the
+/// pattern string (which is always `&'static str`). Avoids recompiling the same
+/// small set of control-code regexes on every `normalize` / `denormalize` call.
+static REGEX_CACHE: LazyLock<Mutex<HashMap<&'static str, regex::Regex>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Get (compiling once) the regex for a static pattern known to be valid.
+fn cached_regex(pat: &'static str) -> regex::Regex {
+    let mut cache = REGEX_CACHE.lock().expect("regex cache mutex");
+    cache
+        .entry(pat)
+        .or_insert_with(|| regex::Regex::new(pat).expect("valid control-code regex"))
+        .clone()
+}
+
+/// The `{n}` placeholder token pattern, compiled once.
+static PLACEHOLDER_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\{(\d+)\}").expect("valid placeholder regex"));
 
 /// How to recognize one class of control code.
 #[derive(Debug, Clone)]
 pub enum ControlPattern {
     /// Exact substring match.
     Literal(&'static str),
-    /// Regex, compiled at call time (Phase 0 specs are static and known-valid).
+    /// Regex source (Phase 0 specs are static and known-valid). Compiled once
+    /// and cached, keyed on this string.
     Regex(&'static str),
 }
 
@@ -86,7 +107,7 @@ fn spans(raw: &str, spec: &ControlCodeSpec) -> Vec<(usize, usize, String)> {
             out
         }
         ControlPattern::Regex(pat) => {
-            let re = regex::Regex::new(pat).expect("valid control-code regex");
+            let re = cached_regex(pat);
             re.find_iter(raw)
                 .map(|m| (m.start(), m.end(), m.as_str().to_string()))
                 .collect()
@@ -147,7 +168,7 @@ pub fn normalize(raw: &str, specs: &[ControlCodeSpec]) -> (String, PlaceholderMa
 /// used exactly once in a different order — is allowed. The error's `Display`
 /// contains the offending `{n}` token.
 pub fn denormalize(norm: &str, map: &PlaceholderMap) -> Result<String> {
-    let re = regex::Regex::new(r"\{(\d+)\}").expect("valid placeholder regex");
+    let re = &*PLACEHOLDER_RE;
     let mut out = String::with_capacity(norm.len());
     let mut last = 0;
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();

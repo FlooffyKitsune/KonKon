@@ -243,6 +243,28 @@ fn build_after_apply_bails_then_revert_and_verify_succeed() {
 }
 
 #[test]
+fn extract_twice_bails_instead_of_raising_a_unique_error() {
+    let workspace = tempdir().unwrap();
+    let game = tempdir().unwrap();
+    fake_game(game.path(), "おはよう");
+    konkon()
+        .args(["project", "new"])
+        .arg(game.path())
+        .args(["--name", "Twice", "--into"])
+        .arg(workspace.path())
+        .assert()
+        .success();
+    let proj = workspace.path().join("Twice.konkon");
+    konkon().args(["extract"]).arg(&proj).assert().success();
+    konkon()
+        .args(["extract"])
+        .arg(&proj)
+        .assert()
+        .failure()
+        .stderr(contains("already has extracted data"));
+}
+
+#[test]
 fn project_new_on_unknown_dir_fails_cleanly() {
     let empty = tempdir().unwrap();
     let ws = tempdir().unwrap();

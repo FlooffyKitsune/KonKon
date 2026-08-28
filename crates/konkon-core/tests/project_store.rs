@@ -39,6 +39,31 @@ fn create_refuses_to_clobber_an_existing_project() {
 }
 
 #[test]
+fn transaction_rolls_back_on_error() {
+    let tmp = tempdir().unwrap();
+    let proj = Project::create(tmp.path(), "G").unwrap();
+    let store = proj.store().unwrap();
+
+    let r: konkon_core::Result<()> = store.transaction(|s| {
+        s.insert_source_file("a.bin", "ethornell", "cp932", "x", "{}")?;
+        Err(konkon_core::KonkonError::Other("boom".into()))
+    });
+    assert!(r.is_err());
+    assert!(
+        store.all_source_files().unwrap().is_empty(),
+        "the failed transaction's insert must have rolled back"
+    );
+
+    store
+        .transaction(|s| {
+            s.insert_source_file("b.bin", "ethornell", "cp932", "y", "{}")?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(store.all_source_files().unwrap().len(), 1);
+}
+
+#[test]
 fn store_roundtrips_source_file_units_translations() {
     let tmp = tempdir().unwrap();
     let proj = Project::create(tmp.path(), "G").unwrap();

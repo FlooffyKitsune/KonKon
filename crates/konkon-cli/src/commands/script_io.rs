@@ -4,7 +4,6 @@
 //! One JSON object per unit:
 //! `{"file":REL,"ordinal":N,"speaker":..,"jp":jp_norm,"en":text_en_or_empty}`.
 
-use anyhow::anyhow;
 use konkon_core::project::Project;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -52,32 +51,42 @@ pub fn import(project: &Path, jsonl: &Path) -> anyhow::Result<()> {
     let proj = Project::open(project)?;
     let store = proj.store()?;
 
-    // rel_path -> file id, resolved once.
-    let files = store.all_source_files()?;
+    // (rel_path, ordinal) -> unit id, resolved once.
+    let mut unit_ids: std::collections::HashMap<(String, i64), i64> =
+        std::collections::HashMap::new();
+    for sf in store.all_source_files()? {
+        for u in store.units_for_file(sf.id)? {
+            unit_ids.insert((sf.rel_path.clone(), u.ordinal), u.id);
+        }
+    }
 
     let text = std::fs::read_to_string(jsonl)?;
-    let mut n = 0usize;
-    for (lineno, raw) in text.lines().enumerate() {
-        if raw.trim().is_empty() {
-            continue;
+    let n = store.transaction(|store| {
+        let mut n = 0usize;
+        for (lineno, raw) in text.lines().enumerate() {
+            if raw.trim().is_empty() {
+                continue;
+            }
+            let line: Line = serde_json::from_str(raw)
+                .map_err(|e| konkon_core::KonkonError::Other(format!(
+                    "{}:{}: {e}",
+                    jsonl.display(),
+                    lineno + 1
+                )))?;
+            if line.en.is_empty() {
+                continue;
+            }
+            let unit_id = unit_ids
+                .get(&(line.file.clone(), line.ordinal))
+                .ok_or_else(|| konkon_core::KonkonError::Other(format!(
+                    "unknown unit: ordinal {} in {}",
+                    line.ordinal, line.file
+                )))?;
+            store.upsert_translation(*unit_id, &line.en, "human", "human")?;
+            n += 1;
         }
-        let line: Line = serde_json::from_str(raw)
-            .map_err(|e| anyhow!("{}:{}: {e}", jsonl.display(), lineno + 1))?;
-        if line.en.is_empty() {
-            continue;
-        }
-        let sf = files
-            .iter()
-            .find(|s| s.rel_path == line.file)
-            .ok_or_else(|| anyhow!("unknown file {}", line.file))?;
-        let unit = store
-            .units_for_file(sf.id)?
-            .into_iter()
-            .find(|u| u.ordinal == line.ordinal)
-            .ok_or_else(|| anyhow!("unknown ordinal {} in {}", line.ordinal, line.file))?;
-        store.upsert_translation(unit.id, &line.en, "human", "human")?;
-        n += 1;
-    }
+        Ok(n)
+    })?;
     println!("imported {n} translations");
     Ok(())
 }

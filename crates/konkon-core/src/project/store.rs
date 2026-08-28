@@ -44,6 +44,15 @@ impl Store {
         Ok(Self { conn })
     }
 
+    /// Run `f` inside a single SQLite transaction, committing on `Ok` and
+    /// rolling back on `Err` (or panic). Nesting is not supported.
+    pub fn transaction<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        let tx = self.conn.unchecked_transaction()?;
+        let out = f(self)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
     pub fn insert_source_file(
         &self,
         rel_path: &str,

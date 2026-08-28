@@ -17,6 +17,28 @@ fn create_project_lays_out_folder_and_db() {
 }
 
 #[test]
+fn create_refuses_to_clobber_an_existing_project() {
+    let tmp = tempdir().unwrap();
+    let first = Project::create(tmp.path(), "G").unwrap();
+    // Put something in the db-adjacent tree to prove it is not wiped.
+    std::fs::write(first.root.join("config.toml"), b"engine_id = 'ethornell'\n").unwrap();
+
+    let err = match Project::create(tmp.path(), "G") {
+        Ok(_) => panic!("expected create to fail on an existing project"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("already exists"),
+        "got: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(first.root.join("config.toml")).unwrap(),
+        "engine_id = 'ethornell'\n",
+        "existing project left untouched"
+    );
+}
+
+#[test]
 fn store_roundtrips_source_file_units_translations() {
     let tmp = tempdir().unwrap();
     let proj = Project::create(tmp.path(), "G").unwrap();

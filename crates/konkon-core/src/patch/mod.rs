@@ -44,6 +44,19 @@ impl Manifest {
     }
 }
 
+/// Join a `/`-separated `rel_path` onto `base` one component at a time.
+///
+/// A plain `base.join(rel_path)` mishandles a forward-slash `rel_path` when
+/// `base` is a `\\?\`-prefixed canonicalized path on Windows (the verbatim
+/// prefix disables separator translation). Splitting on `/` and folding keeps
+/// the manifest's portable `/` form working on every platform.
+pub(crate) fn join_rel(base: &std::path::Path, rel_path: &str) -> std::path::PathBuf {
+    rel_path
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .fold(base.to_path_buf(), |p, c| p.join(c))
+}
+
 /// Lowercase-hex sha256 of a file's contents.
 pub(crate) fn sha256_file(path: &std::path::Path) -> crate::Result<String> {
     use sha2::{Digest, Sha256};

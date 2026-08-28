@@ -2,6 +2,7 @@
 
 use konkon_core::engines::{RepackCtx, RepackFile, RepackUnit};
 use konkon_core::patch::apply as patch_apply;
+use konkon_core::patch::apply::PatchStatus;
 use konkon_core::patch::build::write_artifact;
 use konkon_core::project::Project;
 use std::path::Path;
@@ -10,6 +11,15 @@ pub fn build(project: &Path) -> anyhow::Result<()> {
     let proj = Project::open(project)?;
     let cfg = proj.config()?;
     let (game_dir, engine) = super::resolved(&cfg)?;
+
+    match patch_apply::status(&proj, &game_dir)? {
+        PatchStatus::Applied | PatchStatus::Partial => anyhow::bail!(
+            "patch is currently applied — run `konkon revert` before rebuilding \
+             (building now would record the patched files as the originals)"
+        ),
+        PatchStatus::NotApplied => {}
+    }
+
     let store = proj.store()?;
 
     let mut files = Vec::new();

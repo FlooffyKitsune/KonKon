@@ -1,6 +1,6 @@
 //! Install, remove, and inspect a staged patch artifact.
 
-use super::{sha256_file, Manifest};
+use super::{join_rel, sha256_file, Manifest};
 use crate::project::Project;
 use crate::{KonkonError, Result};
 use std::path::Path;
@@ -47,8 +47,8 @@ pub fn apply(project: &Project, game_dir: &Path) -> Result<()> {
             )));
         }
 
-        let target = game_dir.join(&e.rel_path);
-        let backup = backups.join(&e.rel_path);
+        let target = join_rel(game_dir, &e.rel_path);
+        let backup = join_rel(&backups, &e.rel_path);
         if !e.orig_sha256.is_empty() && target.is_file() && !backup.exists() {
             copy_with_parents(&target, &backup)?;
         }
@@ -74,8 +74,8 @@ pub fn revert(project: &Project, game_dir: &Path) -> Result<()> {
     let manifest = Manifest::load(&project.root.join("patch"))?;
 
     for e in &manifest.entries {
-        let target = game_dir.join(&e.rel_path);
-        let backup = backups.join(&e.rel_path);
+        let target = join_rel(game_dir, &e.rel_path);
+        let backup = join_rel(&backups, &e.rel_path);
 
         if e.orig_sha256.is_empty() {
             if target.is_file() {
@@ -87,10 +87,17 @@ pub fn revert(project: &Project, game_dir: &Path) -> Result<()> {
         if backup.is_file() {
             copy_with_parents(&backup, &target)?;
             if sha256_file(&target)? != e.orig_sha256 {
-                return Err(KonkonError::Other(format!(
-                    "restored file {} does not match original sha256",
+                // The file IS correctly restored from its backup; only the
+                // manifest's recorded orig_sha256 is wrong (a build that ran
+                // while the patch was applied recorded the patched hash). Warn,
+                // but still remove the backup and succeed so the project is not
+                // permanently wedged.
+                eprintln!(
+                    "warning: {} restored from backup but its recorded original \
+                     sha256 does not match (poisoned manifest); the file is \
+                     correct — rebuild the patch to fix the record",
                     e.rel_path
-                )));
+                );
             }
             std::fs::remove_file(&backup)?;
         }
@@ -110,7 +117,7 @@ pub fn status(project: &Project, game_dir: &Path) -> Result<PatchStatus> {
     let mut total = 0;
     for e in &manifest.entries {
         total += 1;
-        let target = game_dir.join(&e.rel_path);
+        let target = join_rel(game_dir, &e.rel_path);
         if target.is_file() && sha256_file(&target)? == e.patched_sha256 {
             applied += 1;
         }

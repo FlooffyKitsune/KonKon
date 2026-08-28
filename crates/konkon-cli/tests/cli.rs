@@ -163,6 +163,85 @@ fn full_pipeline_new_extract_export_import_build_apply_revert() {
         .stdout(contains("NotApplied"));
 }
 
+/// The sequence C2 broke: after `apply`, a `build` must bail (not silently
+/// record the patched files as originals), and `revert` + `verify` must then
+/// both succeed.
+#[test]
+fn build_after_apply_bails_then_revert_and_verify_succeed() {
+    let workspace = tempdir().unwrap();
+    let game = tempdir().unwrap();
+    fake_game(game.path(), "おはよう");
+
+    konkon()
+        .args(["project", "new"])
+        .arg(game.path())
+        .args(["--name", "Seq", "--into"])
+        .arg(workspace.path())
+        .assert()
+        .success();
+    let proj = workspace.path().join("Seq.konkon");
+
+    konkon().args(["extract"]).arg(&proj).assert().success();
+
+    let export = workspace.path().join("lines.jsonl");
+    konkon()
+        .args(["export"])
+        .arg(&proj)
+        .args(["--out"])
+        .arg(&export)
+        .assert()
+        .success();
+    // Translate exactly one line (ordinal 1, the message).
+    let translated: String = std::fs::read_to_string(&export)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+            if v["ordinal"] == serde_json::json!(1) {
+                v["en"] = serde_json::Value::String("Good morning".into());
+            }
+            v.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&export, translated).unwrap();
+    konkon()
+        .args(["import"])
+        .arg(&proj)
+        .arg(&export)
+        .assert()
+        .success();
+
+    konkon().args(["build"]).arg(&proj).assert().success();
+    konkon()
+        .args(["apply"])
+        .arg(&proj)
+        .assert()
+        .success()
+        .stdout(contains("Applied"));
+
+    // build now must bail with the applied-patch warning.
+    konkon()
+        .args(["build"])
+        .arg(&proj)
+        .assert()
+        .failure()
+        .stderr(contains("revert"));
+
+    konkon()
+        .args(["revert"])
+        .arg(&proj)
+        .assert()
+        .success()
+        .stdout(contains("NotApplied"));
+    konkon()
+        .args(["verify"])
+        .arg(&proj)
+        .assert()
+        .success()
+        .stdout(contains("OK"));
+}
+
 #[test]
 fn project_new_on_unknown_dir_fails_cleanly() {
     let empty = tempdir().unwrap();
